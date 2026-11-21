@@ -105,7 +105,7 @@ uv run portfolio-validate
 ```
 * Generates `data/charts/portfolio_validation.html`.
 
-### 5. Project Forward Real & Nominal Wealth (20-Year Stationary Bootstrap)
+### 5. Project Forward Real & Nominal Wealth (10-Year Stationary Bootstrap)
 Runs a 5,000-path Politis-Romano stationary block bootstrap shifted to forward after-tax CMAs, simulating path-dependent fortnightly cashflow-directed DCA rebalancing, a 10% emergency sell band with CPI-indexed CGT, trading costs, inflation (2.5% CPI), and terminal exit CGT:
 ```bash
 uv run portfolio-project

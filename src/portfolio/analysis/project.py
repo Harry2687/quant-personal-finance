@@ -27,7 +27,7 @@ MEAN_BLOCK_LEN = (
     21  # Politis-Romano stationary bootstrap expected block length (~1 month)
 )
 N_SIMS = 5000
-MAX_YEARS = 20
+MAX_YEARS = 10
 
 
 def load_drift_adjusted_daily_returns() -> np.ndarray:
@@ -210,7 +210,7 @@ def run_projections():
     pl.Config.set_tbl_cols(10)
     pl.Config.set_tbl_width_chars(150)
 
-    horizons = [1, 3, 5, 10, 20]
+    horizons = [1, 3, 5, 7, 10]
     cagr_rows = []
     wealth_real_rows = []
     wealth_nom_rows = []
@@ -286,30 +286,30 @@ def run_projections():
     print("\n=== 3. Terminal DCA Wealth in NOMINAL AUD (2.5% CPI Assumed) ===")
     print(pl.DataFrame(wealth_nom_rows))
 
-    # Head-to-head 20-year comparison across strategies
+    # Head-to-head terminal comparison across strategies
     comp_rows = []
-    infl_20 = (1.0 + INFLATION_RATE) ** MAX_YEARS
+    infl_end = (1.0 + INFLATION_RATE) ** MAX_YEARS
     for name, res in sim_results.items():
-        w20_real = res["yr_wealth_nom"][:, -1] / infl_20
-        w20_liq_real = (
+        w_end_real = res["yr_wealth_nom"][:, -1] / infl_end
+        w_end_liq_real = (
             res["yr_wealth_nom"][:, -1] - res["yr_exit_cgt"][:, -1]
-        ) / infl_20
+        ) / infl_end
         twr_nom_cagr = res["yr_twr"][:, -1] ** (1.0 / MAX_YEARS) - 1.0
         twr_real_cagr = (1.0 + twr_nom_cagr) / (1.0 + INFLATION_RATE) - 1.0
         comp_rows.append(
             {
-                "Strategy (20Y Horizon)": name,
+                f"Strategy ({MAX_YEARS}Y Horizon)": name,
                 "Med Real TWR": f"{np.median(twr_real_cagr) * 100:.2f}%",
                 "Med Nom TWR": f"{np.median(twr_nom_cagr) * 100:.2f}%",
-                "5th %ile Real DCA": f"${np.percentile(w20_real, 5):,.0f}",
-                "Median Real DCA": f"${np.median(w20_real):,.0f}",
-                "Med Net-Liq Real": f"${np.median(w20_liq_real):,.0f}",
-                "Med 20Y MaxDD": f"{np.median(res['max_dd']) * 100:.1f}%",
+                "5th %ile Real DCA": f"${np.percentile(w_end_real, 5):,.0f}",
+                "Median Real DCA": f"${np.median(w_end_real):,.0f}",
+                "Med Net-Liq Real": f"${np.median(w_end_liq_real):,.0f}",
+                f"Med {MAX_YEARS}Y MaxDD": f"{np.median(res['max_dd']) * 100:.1f}%",
                 "95th Worst MaxDD": f"{np.percentile(res['max_dd'], 5) * 100:.1f}%",
             }
         )
     print(
-        "\n=== 4. 20-Year Forward Strategy Comparison (Real 2026 AUD, Forward CMAs + Empirical Tails) ==="
+        f"\n=== 4. {MAX_YEARS}-Year Forward Strategy Comparison (Real 2026 AUD, Forward CMAs + Empirical Tails) ==="
     )
     print(pl.DataFrame(comp_rows))
 
@@ -361,7 +361,7 @@ def run_projections():
     ).encode(y="Real_Contributions:Q")
 
     chart = (band_90 + band_50 + median_line + cost_line).properties(
-        title=f"20-Year Real Wealth Fan Chart: 70/15/12/3 Optimal Portfolio (${STARTING_CAPITAL:,.0f} + ${FORTNIGHTLY_DCA:,.0f}/fn DCA, Forward CMAs)",
+        title=f"{MAX_YEARS}-Year Real Wealth Fan Chart: 70/15/12/3 Optimal Portfolio (${STARTING_CAPITAL:,.0f} + ${FORTNIGHTLY_DCA:,.0f}/fn DCA, Forward CMAs)",
         width=860,
         height=460,
     )
