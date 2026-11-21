@@ -9,14 +9,15 @@ from portfolio.assumptions import (
     ANNUAL_DCA,
     ASSET_ORDER,
     ASSETS,
+    CGT_REAL_GAIN_RATE,
     CHARTS_DIR,
     FORTNIGHTLY_DCA,
     HISA_NET_REAL,
     INFLATION_RATE,
-    LONG_TERM_CGT_RATE,
     NO_CRYPTO_OPTIMAL,
     OPTIMAL_ALLOCATION,
     ORIGINAL_ALLOCATION,
+    REBALANCE_SELL_BAND,
     STARTING_CAPITAL,
 )
 
@@ -71,43 +72,41 @@ def simulate_dca_paths(
     daily_rets: np.ndarray,
     idx: np.ndarray,
     weights: dict[str, float],
-    rebalance_band: float = 0.05,
+    rebalance_band: float = REBALANCE_SELL_BAND,
 ) -> dict[str, np.ndarray]:
-    """Vectorized path-dependent DCA simulation with cashflow-directed rebalancing, CGT, and fees."""
+    """Vectorized path-dependent DCA simulation with cashflow rebalancing, emergency sell band, CPI-indexed CGT, and fees."""
     n_sims, n_days = idx.shape
     n_assets = len(ASSET_ORDER)
     w_target = np.array([weights.get(c, 0.0) for c in ASSET_ORDER], dtype=float)
     trade_costs = np.array([ASSETS[c].trade_cost for c in ASSET_ORDER], dtype=float)
+    daily_cpi_factor = (1.0 + INFLATION_RATE) ** (1.0 / TRADING_DAYS)
 
     entry_cost = float(np.sum(w_target * trade_costs))
     vals = np.broadcast_to(
         STARTING_CAPITAL * (1.0 - entry_cost) * w_target, (n_sims, n_assets)
     ).copy()
-    basis = vals.copy()
+    unindexed_basis = vals.copy()
+    indexed_basis = vals.copy()
 
-    # Pure lump-sum index (for horizon CAGR & max-drawdown calculation)
-    lump_vals = np.broadcast_to(
-        (1.0 - entry_cost) * w_target, (n_sims, n_assets)
-    ).copy()
-    lump_peak = np.ones(n_sims)
+    # Time-weighted return (TWR) index of the actual DCA-rebalanced portfolio (excludes cashflow sizing)
+    twr_idx = np.full(n_sims, 1.0 - entry_cost)
+    twr_peak = twr_idx.copy()
     max_dd = np.zeros(n_sims)
 
-    # Track exact year-end nominal wealth, basis, and lump-sum multiple (years 1..MAX_YEARS)
+    # Track exact year-end nominal wealth, per-asset exit CGT, and DCA portfolio TWR (years 1..MAX_YEARS)
     yr_wealth_nom = np.zeros((n_sims, MAX_YEARS))
-    yr_basis = np.zeros((n_sims, MAX_YEARS))
-    yr_lump = np.zeros((n_sims, MAX_YEARS))
+    yr_exit_cgt = np.zeros((n_sims, MAX_YEARS))
+    yr_twr = np.zeros((n_sims, MAX_YEARS))
 
     # 26 fortnightly contributions per 252 trading days (~every 9.69 trading days)
     dca_days = set(np.round(np.linspace(10, TRADING_DAYS, 26)).astype(int).tolist())
 
     for d in range(n_days):
+        tot_before = np.sum(vals, axis=1)
         r_d = daily_rets[idx[:, d]]  # (n_sims, n_assets)
         vals *= 1.0 + r_d
-        lump_vals *= 1.0 + r_d
-
-        lump_tot = np.sum(lump_vals, axis=1)
-        lump_peak = np.maximum(lump_peak, lump_tot)
-        max_dd = np.minimum(max_dd, lump_tot / lump_peak - 1.0)
+        indexed_basis *= daily_cpi_factor
+        r_mkt = np.sum(vals, axis=1) / tot_before - 1.0
 
         day_in_year = (d % TRADING_DAYS) + 1
 
@@ -123,17 +122,19 @@ def simulate_dca_paths(
             contrib = FORTNIGHTLY_DCA * alloc_frac
             net_contrib = contrib * (1.0 - trade_costs)
             vals += net_contrib
-            basis += contrib
+            unindexed_basis += contrib
+            indexed_basis += contrib
 
-        # Monthly tolerance-band check for taxable rebalancing when cashflow alone cannot prevent drift
+        # Monthly emergency sell-band check when DCA cashflows alone cannot prevent extreme drift
+        rebal_drag = np.zeros(n_sims)
         if (d + 1) % 21 == 0:
-            # DCA portfolio
             tot = np.sum(vals, axis=1)
             cur_w = vals / tot[:, None]
             breached = np.max(np.abs(cur_w - w_target), axis=1) >= rebalance_band
             if np.any(breached):
                 b_vals = vals[breached]
-                b_basis = basis[breached]
+                b_unidx = unindexed_basis[breached]
+                b_basis = indexed_basis[breached]
                 b_tot = tot[breached]
                 b_target = b_tot[:, None] * w_target
                 trades = b_target - b_vals
@@ -143,42 +144,44 @@ def simulate_dca_paths(
                 sell_frac = np.where(
                     b_vals > 0, sells / np.where(b_vals > 0, b_vals, 1.0), 0.0
                 )
+                unidx_sold = b_unidx * sell_frac
                 basis_sold = b_basis * sell_frac
-                gains = np.maximum(sells - basis_sold, 0.0)
-                cgt = np.sum(gains * LONG_TERM_CGT_RATE, axis=1)
+                real_gains = np.maximum(sells - basis_sold, 0.0)
+                cap_losses = np.maximum(unidx_sold - sells, 0.0)
+                net_gain = np.maximum(
+                    np.sum(real_gains, axis=1) - np.sum(cap_losses, axis=1), 0.0
+                )
+                cgt = net_gain * CGT_REAL_GAIN_RATE
                 fees = np.sum((sells + buys) * trade_costs, axis=1)
 
                 post_tot = b_tot - cgt - fees
+                rebal_drag[breached] = (cgt + fees) / b_tot
                 new_vals = post_tot[:, None] * w_target
-                new_basis = (
-                    b_basis - basis_sold + np.maximum(new_vals - (b_vals - sells), 0.0)
-                )
+                buy_add = np.maximum(new_vals - (b_vals - sells), 0.0)
                 vals[breached] = new_vals
-                basis[breached] = new_basis
+                unindexed_basis[breached] = b_unidx - unidx_sold + buy_add
+                indexed_basis[breached] = b_basis - basis_sold + buy_add
 
-            # Lump-sum tracker band rebalance
-            l_w = lump_vals / lump_tot[:, None]
-            l_breach = np.max(np.abs(l_w - w_target), axis=1) >= rebalance_band
-            if np.any(l_breach):
-                lb_vals = lump_vals[l_breach]
-                lb_tot = lump_tot[l_breach]
-                lb_trades = lb_tot[:, None] * w_target - lb_vals
-                lb_fees = np.sum(np.abs(lb_trades) * trade_costs, axis=1)
-                # Approximate CGT drag on lump-sum rebalance (half of sold excess assumed gain)
-                lb_sells = np.maximum(-lb_trades, 0.0)
-                lb_cgt = np.sum(lb_sells * 0.40 * LONG_TERM_CGT_RATE, axis=1)
-                lump_vals[l_breach] = (lb_tot - lb_fees - lb_cgt)[:, None] * w_target
+        twr_idx *= (1.0 + r_mkt) * (1.0 - rebal_drag)
+        twr_peak = np.maximum(twr_peak, twr_idx)
+        max_dd = np.minimum(max_dd, twr_idx / twr_peak - 1.0)
 
         if day_in_year == TRADING_DAYS:
             yr = d // TRADING_DAYS
             yr_wealth_nom[:, yr] = np.sum(vals, axis=1)
-            yr_basis[:, yr] = np.sum(basis, axis=1)
-            yr_lump[:, yr] = np.sum(lump_vals, axis=1)
+            # Per-asset liquidation CGT: indexation applies to gains only; losses use unindexed cost base
+            exit_real_gains = np.maximum(vals - indexed_basis, 0.0)
+            exit_cap_losses = np.maximum(unindexed_basis - vals, 0.0)
+            net_exit_gain = np.maximum(
+                np.sum(exit_real_gains, axis=1) - np.sum(exit_cap_losses, axis=1), 0.0
+            )
+            yr_exit_cgt[:, yr] = net_exit_gain * CGT_REAL_GAIN_RATE
+            yr_twr[:, yr] = twr_idx
 
     return {
         "yr_wealth_nom": yr_wealth_nom,
-        "yr_basis": yr_basis,
-        "yr_lump": yr_lump,
+        "yr_exit_cgt": yr_exit_cgt,
+        "yr_twr": yr_twr,
         "max_dd": max_dd,
     }
 
@@ -214,8 +217,8 @@ def run_projections():
 
     for y in horizons:
         infl = (1.0 + INFLATION_RATE) ** y
-        lump_y = primary["yr_lump"][:, y - 1]
-        cagr_nom = lump_y ** (1.0 / y) - 1.0
+        twr_y = primary["yr_twr"][:, y - 1]
+        cagr_nom = twr_y ** (1.0 / y) - 1.0
         cagr_real = (1.0 + cagr_nom) / (1.0 + INFLATION_RATE) - 1.0
 
         p05, p25, p50, p75, p95 = np.percentile(cagr_real, [5, 25, 50, 75, 95])
@@ -235,10 +238,9 @@ def run_projections():
             }
         )
 
-        # Path-dependent DCA wealth (pre-exit-CGT and net after-exit-CGT)
+        # Path-dependent DCA wealth (pre-exit-CGT and net after per-asset CPI-indexed exit CGT)
         w_nom = primary["yr_wealth_nom"][:, y - 1]
-        b_nom = primary["yr_basis"][:, y - 1]
-        exit_cgt = np.maximum(w_nom - b_nom, 0.0) * LONG_TERM_CGT_RATE
+        exit_cgt = primary["yr_exit_cgt"][:, y - 1]
         w_net_liq_nom = w_nom - exit_cgt
         w_real = w_nom / infl
         w_net_liq_real = w_net_liq_nom / infl
@@ -272,12 +274,12 @@ def run_projections():
         )
 
     print(
-        f"\n=== 1. New Optimal (70 BGBL / 15 BEMG / 12 Gold / 3 BTC): Real After-Tax Annualized Return Distribution ({N_SIMS:,} Stationary Bootstrap Paths) ==="
+        f"\n=== 1. New Optimal (70 BGBL / 15 BEMG / 12 Gold / 3 BTC): Real After-Tax TWR Distribution ({N_SIMS:,} Stationary Bootstrap Paths, DCA + {int(REBALANCE_SELL_BAND * 100)}% Sell Band) ==="
     )
     print(pl.DataFrame(cagr_rows))
 
     print(
-        f"\n=== 2. Terminal DCA Wealth in REAL 2026 AUD (${STARTING_CAPITAL:,.0f} + ${FORTNIGHTLY_DCA:,.0f}/fn, Path-Dependent Cashflow Rebalancing) ==="
+        f"\n=== 2. Terminal DCA Wealth in REAL 2026 AUD (${STARTING_CAPITAL:,.0f} + ${FORTNIGHTLY_DCA:,.0f}/fn, Cashflow Rebalancing + {int(REBALANCE_SELL_BAND * 100)}% Emergency Sell Band) ==="
     )
     print(pl.DataFrame(wealth_real_rows))
 
@@ -289,18 +291,16 @@ def run_projections():
     infl_20 = (1.0 + INFLATION_RATE) ** MAX_YEARS
     for name, res in sim_results.items():
         w20_real = res["yr_wealth_nom"][:, -1] / infl_20
-        b20 = res["yr_basis"][:, -1]
         w20_liq_real = (
-            res["yr_wealth_nom"][:, -1]
-            - np.maximum(res["yr_wealth_nom"][:, -1] - b20, 0.0) * LONG_TERM_CGT_RATE
+            res["yr_wealth_nom"][:, -1] - res["yr_exit_cgt"][:, -1]
         ) / infl_20
-        lump_real_cagr = (res["yr_lump"][:, -1] ** (1.0 / MAX_YEARS)) / (
-            1.0 + INFLATION_RATE
-        ) - 1.0
+        twr_nom_cagr = res["yr_twr"][:, -1] ** (1.0 / MAX_YEARS) - 1.0
+        twr_real_cagr = (1.0 + twr_nom_cagr) / (1.0 + INFLATION_RATE) - 1.0
         comp_rows.append(
             {
                 "Strategy (20Y Horizon)": name,
-                "Med Real CAGR": f"{np.median(lump_real_cagr) * 100:.2f}%",
+                "Med Real TWR": f"{np.median(twr_real_cagr) * 100:.2f}%",
+                "Med Nom TWR": f"{np.median(twr_nom_cagr) * 100:.2f}%",
                 "5th %ile Real DCA": f"${np.percentile(w20_real, 5):,.0f}",
                 "Median Real DCA": f"${np.median(w20_real):,.0f}",
                 "Med Net-Liq Real": f"${np.median(w20_liq_real):,.0f}",

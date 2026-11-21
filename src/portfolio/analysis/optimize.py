@@ -225,18 +225,26 @@ def run_optimization():
     pl.Config.set_tbl_width_chars(180)
     pl.Config.set_fmt_str_lengths(120)
 
+    rec_full = recenter_empirical_returns(wk_full, mu_net)
+    rec_recent = recenter_empirical_returns(wk_recent, mu_net)
+
     print("\n=== 1. Forward CMAs (Ex-Australia Universe, 39% AU Marginal Tax Rate) ===")
     cma_rows = []
     for i, c in enumerate(ASSET_ORDER):
         s = ASSETS[c]
+        geo_nom_i = float(
+            np.exp(np.mean(np.log1p(rec_full[:, i])) * WEEKS_PER_YEAR) - 1.0
+        )
+        geo_real_i = (1.0 + geo_nom_i) / (1.0 + INFLATION_RATE) - 1.0
         cma_rows.append(
             {
                 "Asset": c,
                 "MER": f"{s.mer * 100:.2f}%",
-                "Gross Nom": f"{mu_gross[i] * 100:.2f}%",
+                "Gross Arith": f"{mu_gross[i] * 100:.2f}%",
                 "Tax Drag": f"{tax_drags[i] * 100:.2f}%",
-                "Net Nom": f"{mu_net[i] * 100:.2f}%",
-                "Net Real": f"{s.cma_net_real * 100:.2f}%",
+                "Net Arith": f"{mu_net[i] * 100:.2f}%",
+                "Net Geo Nom": f"{geo_nom_i * 100:.2f}%",
+                "Net Geo Real": f"{geo_real_i * 100:.2f}%",
                 "Wk Vol (Full)": f"{vols_full[i] * 100:.1f}%",
                 "Wk Vol (2020+)": f"{vols_recent[i] * 100:.1f}%",
             }
@@ -257,9 +265,6 @@ def run_optimization():
         }
     )
     print(corr_df)
-
-    rec_full = recenter_empirical_returns(wk_full, mu_net)
-    rec_recent = recenter_empirical_returns(wk_recent, mu_net)
 
     # Order: [BGBL, HGBL, BEMG, VAF, PMGOLD, BTC]
     bounds_unconstrained = [(0.0, 1.0)] * len(ASSET_ORDER)
@@ -348,8 +353,8 @@ def run_optimization():
         "\n=== 4. CMA Sensitivity Sweep (CRRA Growth gamma=3.0, BEMG<=15%, Gold<=15%, BTC<=10%) ==="
     )
     sens_rows = []
-    for btc_cma in [0.04, 0.10, 0.15, 0.20]:
-        for gold_cma in [0.025, 0.04, 0.06]:
+    for btc_cma in [0.06, 0.12, 0.18, 0.24]:
+        for gold_cma in [0.035, 0.05, 0.07]:
             mu_s = mu_net.copy()
             mu_s[ASSET_ORDER.index("PMGOLD")] = gold_cma
             mu_s[ASSET_ORDER.index("BTC")] = btc_cma

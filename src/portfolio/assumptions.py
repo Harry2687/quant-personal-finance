@@ -1,5 +1,6 @@
 import json
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -26,17 +27,39 @@ ANNUAL_DCA = FORTNIGHTLY_DCA * 26
 EMERGENCY_CASH = float(_PROFILE.get("emergency_cash", 30_000.0))
 
 MARGINAL_TAX_RATE = float(_PROFILE.get("marginal_tax_rate", 0.39))  # 37% + 2% Medicare
-CGT_DISCOUNT = 0.50
-LONG_TERM_CGT_RATE = MARGINAL_TAX_RATE * (1.0 - CGT_DISCOUNT)  # 19.5%
 INFLATION_RATE = 0.025  # RBA target midpoint
+
+# Treasury Laws Amendment (Tax Reform No. 1) Act 2026 (effective 1 July 2027):
+# Replaces the 50% CGT discount with CPI cost-base indexation and a 30% minimum tax floor.
+CGT_REFORM_DATE = date(2027, 7, 1)
+CGT_MIN_TAX_RATE = 0.30
+CGT_REAL_GAIN_RATE = max(CGT_MIN_TAX_RATE, MARGINAL_TAX_RATE)  # 39% at 39% MTR
+# Legacy 50% discount applies only to gains accrued prior to 1 July 2027 (held >12 months)
+LEGACY_CGT_DISCOUNT = 0.50
+LEGACY_LONG_TERM_CGT_RATE = MARGINAL_TAX_RATE * (1.0 - LEGACY_CGT_DISCOUNT)
+# Approx real-gain share of AMIT ETF capital gain distributions after CPI indexation
+AMIT_CG_REAL_SHARE = 0.75
 
 HISA_GROSS_RATE = float(_PROFILE.get("hisa_gross_rate", 0.05))
 HISA_NET_NOMINAL = HISA_GROSS_RATE * (1.0 - MARGINAL_TAX_RATE)  # 3.05%
 HISA_NET_REAL = (1.0 + HISA_NET_NOMINAL) / (1.0 + INFLATION_RATE) - 1.0
 LEDGER_START_DATE = str(_PROFILE.get("ledger_start_date", "2020-01-01"))
 
+
+def calculate_indexed_cgt(
+    proceeds: float,
+    indexed_cost_base: float,
+    tax_rate: float = CGT_REAL_GAIN_RATE,
+) -> float:
+    """Compute post-1 July 2027 Australian CGT on real indexed capital gains (gains only)."""
+    real_gain = max(proceeds - indexed_cost_base, 0.0)
+    return real_gain * tax_rate
+
+
 # Ex-Australia candidate universe (AU exposure covered by salary, HISA cash, and future AU property)
 ASSET_ORDER = ["BGBL", "HGBL", "BEMG", "VAF", "PMGOLD", "BTC"]
+# Emergency taxable sell threshold when DCA inflows alone cannot absorb drift under 39% real CGT
+REBALANCE_SELL_BAND = 0.10
 
 # Placeholder defaults updated after running optimize_allocation.py
 OPTIMAL_ALLOCATION = {
@@ -69,8 +92,8 @@ class AssetSpec:
     cma_gross_nominal: float
     # Expected annual taxable AU cash distribution yield
     dist_yield: float
-    # Fraction of cash distribution that is 50%-discounted capital gain
-    cg_discount_frac: float = 0.0
+    # Fraction of cash distribution that is realized AMIT capital gain (indexed post-1 July 2027)
+    cg_dist_frac: float = 0.0
     # Foreign income tax offset as fraction of cash distribution (grossed up)
     fito_frac_of_cash: float = 0.0
     # One-way trading fee + estimated bid-ask spread
@@ -81,12 +104,13 @@ class AssetSpec:
         """Net annual Australian income tax drag relative to untaxed total return."""
         if self.dist_yield <= 0.0:
             return 0.0
-        cg_part = self.dist_yield * self.cg_discount_frac
+        cg_part = self.dist_yield * self.cg_dist_frac
         inc_part = self.dist_yield - cg_part
         fito = inc_part * self.fito_frac_of_cash
         gross_inc = inc_part + fito
         net_inc_tax = gross_inc * MARGINAL_TAX_RATE - fito
-        return net_inc_tax + cg_part * LONG_TERM_CGT_RATE
+        # Post-1 July 2027: AMIT real indexed capital gains taxed at max(30%, MTR)
+        return net_inc_tax + cg_part * AMIT_CG_REAL_SHARE * CGT_REAL_GAIN_RATE
 
     @property
     def cma_net_nominal(self) -> float:
@@ -106,9 +130,9 @@ ASSETS: dict[str, AssetSpec] = {
         proxy_ticker="VGS.AX",
         min_actual_date="2023-06-01",
         mer=0.0008,
-        cma_gross_nominal=0.080,
+        cma_gross_nominal=0.090,  # ~8.2% gross / ~7.5% net geometric nominal (~4.9% net real)
         dist_yield=0.022,
-        cg_discount_frac=0.20,
+        cg_dist_frac=0.20,
         fito_frac_of_cash=0.14,
         trade_cost=0.0005,
     ),
@@ -119,9 +143,9 @@ ASSETS: dict[str, AssetSpec] = {
         proxy_ticker="VGAD.AX",
         min_actual_date="2023-06-01",
         mer=0.0011,
-        cma_gross_nominal=0.079,
+        cma_gross_nominal=0.089,  # Same equity ERP as BGBL minus higher MER & FX hedge friction
         dist_yield=0.032,  # Higher distributions from TOFA FX forward gains
-        cg_discount_frac=0.10,
+        cg_dist_frac=0.10,
         fito_frac_of_cash=0.09,
         trade_cost=0.0008,
     ),
@@ -132,8 +156,8 @@ ASSETS: dict[str, AssetSpec] = {
         proxy_ticker="IEM.AX",  # Exact MSCI EM index match (incl. South Korea)
         min_actual_date="2026-01-01",
         mer=0.0035,
-        # ~8.4% gross EM return minus ~0.4% unrecoverable internal WHT inside MSCI NTR swap
-        cma_gross_nominal=0.080,
+        # ~9.6% gross EM arith minus ~0.4% unrecoverable internal WHT inside MSCI NTR swap (~8.0% net geo)
+        cma_gross_nominal=0.092,
         dist_yield=0.0,  # Non-distributing accumulating UCITS swap structure (0% ongoing AU tax drag)
         trade_cost=0.0015,  # Slightly wider spread for newer ASX complex ETF
     ),
@@ -144,9 +168,9 @@ ASSETS: dict[str, AssetSpec] = {
         proxy_ticker=None,
         min_actual_date=None,
         mer=0.0010,
-        cma_gross_nominal=0.045,
+        cma_gross_nominal=0.048,
         dist_yield=0.040,
-        cg_discount_frac=0.0,
+        cg_dist_frac=0.0,
         trade_cost=0.0005,
     ),
     "PMGOLD": AssetSpec(
@@ -156,7 +180,7 @@ ASSETS: dict[str, AssetSpec] = {
         proxy_ticker="GOLD.AX",
         min_actual_date="2022-01-01",
         mer=0.0015,
-        cma_gross_nominal=0.040,  # ~1.5% real above 2.5% CPI
+        cma_gross_nominal=0.050,  # ~3.9% geometric nominal (~1.4% real compound above 2.5% CPI)
         dist_yield=0.0,
         trade_cost=0.0008,
     ),
@@ -167,7 +191,7 @@ ASSETS: dict[str, AssetSpec] = {
         proxy_ticker=None,
         min_actual_date=None,
         mer=0.0,
-        cma_gross_nominal=0.100,  # Base-case moderated forward arithmetic return
+        cma_gross_nominal=0.120,  # Moderated forward arithmetic return (equity ERP + 3% risk premium)
         dist_yield=0.0,
         trade_cost=0.0080,  # Swyftx 0.60% fee + ~0.20% spread
     ),

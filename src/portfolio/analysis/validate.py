@@ -9,13 +9,15 @@ from portfolio.analysis.fetch_data import DATA_FILE, fetch_market_data
 from portfolio.assumptions import (
     ASSET_ORDER,
     ASSETS,
+    CGT_REAL_GAIN_RATE,
     CHARTS_DIR,
     HISA_NET_NOMINAL,
-    LONG_TERM_CGT_RATE,
+    INFLATION_RATE,
     NO_CRYPTO_OPTIMAL,
     OPTIMAL_ALLOCATION,
     ORIGINAL_ALLOCATION,
     STARTING_CAPITAL,
+    calculate_indexed_cgt,
 )
 
 CHART_FILE = CHARTS_DIR / "portfolio_validation.html"
@@ -72,15 +74,16 @@ def simulate_portfolio(
     rebalance_band: float = 0.05,
     apply_frictions: bool = True,
 ) -> tuple[np.ndarray, float]:
-    """Simulate portfolio with tolerance-band rebalancing, trading costs, and long-term CGT."""
+    """Simulate portfolio with tolerance-band rebalancing, trading costs, and CPI-indexed CGT."""
     n_days, n_assets = net_rets.shape
     w_target = np.array([weights.get(c, 0.0) for c in ASSET_ORDER], dtype=float)
     trade_costs = np.array([ASSETS[c].trade_cost for c in ASSET_ORDER], dtype=float)
+    daily_cpi_factor = (1.0 + INFLATION_RATE) ** (1.0 / TRADING_DAYS)
 
     # Initial deployment (deduct entry trade cost if frictions enabled)
     entry_cost = float(np.sum(w_target * trade_costs)) if apply_frictions else 0.0
     values = STARTING_CAPITAL * (1.0 - entry_cost) * w_target.copy()
-    cost_basis = values.copy()
+    indexed_basis = values.copy()
 
     daily_port_rets = np.zeros(n_days)
     total_turnover = 0.0
@@ -88,6 +91,7 @@ def simulate_portfolio(
     for d in range(n_days):
         prev_total = float(np.sum(values))
         values *= 1.0 + net_rets[d]
+        indexed_basis *= daily_cpi_factor
         cur_total = float(np.sum(values))
 
         # Check monthly (every 21 trading days) for tolerance-band breach
@@ -102,22 +106,25 @@ def simulate_portfolio(
                 total_turnover += float(np.sum(sells)) / cur_total
 
                 if apply_frictions:
-                    # Realized capital gains tax on sold appreciated parcels (50% CGT discount)
+                    # Post-1 July 2027 CGT: CPI-indexed real gains taxed at max(30%, MTR)
                     cgt_paid = 0.0
                     for i in range(n_assets):
                         if sells[i] > 0 and values[i] > 0:
                             sell_frac = sells[i] / values[i]
-                            basis_sold = cost_basis[i] * sell_frac
-                            gain = max(sells[i] - basis_sold, 0.0)
-                            cgt_paid += gain * LONG_TERM_CGT_RATE
-                            cost_basis[i] -= basis_sold
+                            basis_sold = indexed_basis[i] * sell_frac
+                            cgt_paid += calculate_indexed_cgt(
+                                float(sells[i]),
+                                float(basis_sold),
+                                CGT_REAL_GAIN_RATE,
+                            )
+                            indexed_basis[i] -= basis_sold
                     fee_paid = float(np.sum((sells + buys) * trade_costs))
                     post_total = cur_total - cgt_paid - fee_paid
                     values = post_total * w_target
-                    # Update cost basis for newly purchased units
+                    # Update indexed cost basis for newly purchased units
                     for i in range(n_assets):
                         if buys[i] > 0:
-                            cost_basis[i] += max(
+                            indexed_basis[i] += max(
                                 values[i] - (target_vals[i] - buys[i]), 0.0
                             )
                 else:

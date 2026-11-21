@@ -14,10 +14,14 @@ import numpy as np
 import yfinance as yf
 
 from portfolio.assumptions import (
+    CGT_MIN_TAX_RATE,
+    CGT_REAL_GAIN_RATE,
+    CGT_REFORM_DATE,
     FORTNIGHTLY_DCA,
     LEDGER_DB_PATH,
     LEDGER_START_DATE,
     OPTIMAL_ALLOCATION,
+    REBALANCE_SELL_BAND,
 )
 
 DB_PATH = LEDGER_DB_PATH
@@ -469,7 +473,14 @@ def get_betashares_positions(
         if qty <= 1e-6:
             continue
         cost = sum(lot["cost_aud"] for lot in sym_lots)
-        lt_qty = sum(
+        # Lots acquired prior to 1 July 2027 retain legacy 50% discount on gains accrued up to 30 June 2027;
+        # holding >= 12 months is also required for CPI cost-base indexation post-1 July 2027.
+        pre_reform_qty = sum(
+            lot["quantity"]
+            for lot in sym_lots
+            if date.fromisoformat(lot["trade_date"]) < CGT_REFORM_DATE
+        )
+        held_12m_qty = sum(
             lot["quantity"]
             for lot in sym_lots
             if (today - date.fromisoformat(lot["trade_date"])).days >= 365
@@ -477,8 +488,11 @@ def get_betashares_positions(
         positions[sym] = {
             "units": qty,
             "cost_basis_aud": cost,
-            "lt_cgt_eligible_units": lt_qty,
-            "lt_cgt_eligible_pct": (lt_qty / qty * 100.0) if qty > 0 else 0.0,
+            "pre_reform_grandfathered_units": pre_reform_qty,
+            "pre_reform_grandfathered_pct": (pre_reform_qty / qty * 100.0)
+            if qty > 0
+            else 0.0,
+            "held_12m_plus_pct": (held_12m_qty / qty * 100.0) if qty > 0 else 0.0,
             "earliest_lot_date": sym_lots[0]["trade_date"],
         }
     return positions, all_trades
@@ -516,21 +530,38 @@ def get_live_portfolio(sync_gmail: bool = True, db_path: Path = DB_PATH) -> dict
         if ticker == "BTC":
             units = swyftx["btc_units"]
             cost = swyftx["btc_cost_basis_aud"]
-            earliest = (
-                swyftx["btc_buys"][0]["trade_date"] if swyftx["btc_buys"] else None
-            )
-            lt_pct = (
-                100.0
-                if earliest and (today - date.fromisoformat(earliest)).days >= 365
-                else 0.0
-            )
+            btc_buys = swyftx["btc_buys"]
+            earliest = btc_buys[0]["trade_date"] if btc_buys else None
+            if cost > 0 and btc_buys:
+                pre_reform_pct = (
+                    sum(
+                        b["total_aud"]
+                        for b in btc_buys
+                        if date.fromisoformat(b["trade_date"]) < CGT_REFORM_DATE
+                    )
+                    / cost
+                    * 100.0
+                )
+                held_12m_pct = (
+                    sum(
+                        b["total_aud"]
+                        for b in btc_buys
+                        if (today - date.fromisoformat(b["trade_date"])).days >= 365
+                    )
+                    / cost
+                    * 100.0
+                )
+            else:
+                pre_reform_pct = 0.0
+                held_12m_pct = 0.0
             platform = "Swyftx"
         else:
             pos = bs_positions.get(ticker, {})
             units = pos.get("units", 0.0)
             cost = pos.get("cost_basis_aud", 0.0)
             earliest = pos.get("earliest_lot_date")
-            lt_pct = pos.get("lt_cgt_eligible_pct", 0.0)
+            pre_reform_pct = pos.get("pre_reform_grandfathered_pct", 0.0)
+            held_12m_pct = pos.get("held_12m_plus_pct", 0.0)
             platform = "Betashares Direct"
 
         val = units * px
@@ -552,7 +583,8 @@ def get_live_portfolio(sync_gmail: bool = True, db_path: Path = DB_PATH) -> dict
                 "target_weight_pct": round(
                     OPTIMAL_ALLOCATION.get(ticker, 0.0) * 100.0, 2
                 ),
-                "lt_cgt_eligible_pct": round(lt_pct, 1),
+                "held_12m_plus_pct": round(held_12m_pct, 1),
+                "pre_july_2027_grandfathered_pct": round(pre_reform_pct, 1),
                 "earliest_lot_date": earliest,
             }
         )
@@ -596,6 +628,14 @@ def get_live_portfolio(sync_gmail: bool = True, db_path: Path = DB_PATH) -> dict
     return {
         "as_of": datetime.now(UTC).isoformat(),
         "target_allocation": OPTIMAL_ALLOCATION,
+        "cgt_regime": {
+            "legislation": "Treasury Laws Amendment (Tax Reform No. 1) Act 2026",
+            "effective_date": CGT_REFORM_DATE.isoformat(),
+            "method": "CPI cost-base indexation (held >=12m, gains only) replacing 50% discount",
+            "min_tax_rate_pct": round(CGT_MIN_TAX_RATE * 100.0, 1),
+            "applicable_real_gain_rate_pct": round(CGT_REAL_GAIN_RATE * 100.0, 1),
+            "transitional_note": "Gains accrued prior to 1 July 2027 retain legacy 50% discount rules (record market values on 30 June 2027).",
+        },
         "summary": {
             "total_value_aud": round(total_value, 2),
             "total_cost_basis_aud": round(total_cost, 2),
@@ -657,14 +697,15 @@ def get_next_dca_plan(
     cash_to_balance = max(max_over_tot - tot, 0.0)
     est_fortnights = round(cash_to_balance / amount, 1) if amount > 0 else 0.0
 
+    sell_band_pct = REBALANCE_SELL_BAND * 100.0
     sell_alerts = [
         {
             "ticker": h["ticker"],
             "drift_pct": h["drift_pct"],
-            "note": "Exceeds +5% tolerance band (consider selling >12m lots only if cashflow cannot absorb).",
+            "note": f"Exceeds +{sell_band_pct:.0f}% emergency sell band (real indexed gains post-1 July 2027 taxed at max(30%, MTR); prefer cashflow rebalancing).",
         }
         for h in port["holdings"]
-        if h["drift_pct"] >= 5.0 and h["ticker"] != "BGBL"
+        if h["drift_pct"] >= sell_band_pct and h["ticker"] != "BGBL"
     ]
 
     return {
