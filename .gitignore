@@ -1,0 +1,33 @@
+# Byte-compiled / Python caches / Virtual environment
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+
+# Environment & secrets
+.env
+.env.*
+
+# Operating System
+.DS_Store
+Thumbs.db
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Tool caches & logs
+*.log
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Local data, charts, and broker exports
+data/
+*.parquet
+*.html
+*.db
+*.sqlite*
+*.csv

@@ -1,0 +1,56 @@
+[project]
+name = "quant-personal-finance"
+version = "0.1.0"
+description = "Personal finance asset allocation, quantitative modeling, and live portfolio tracker"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "altair>=6.3.0",
+    "mcp>=2.3.0",
+    "polars>=1.44.2",
+    "scipy>=1.18.1",
+    "yfinance>=1.7.0",
+]
+
+[project.scripts]
+portfolio = "portfolio.live.cli:main"
+portfolio-mcp = "portfolio.live.mcp_server:main"
+portfolio-fetch = "portfolio.analysis.fetch_data:fetch_market_data"
+portfolio-optimize = "portfolio.analysis.optimize:run_optimization"
+portfolio-distributions = "portfolio.analysis.distributions:analyze_distributions"
+portfolio-validate = "portfolio.analysis.validate:run_validation"
+portfolio-project = "portfolio.analysis.project:run_projections"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/portfolio"]
+
+[dependency-groups]
+dev = [
+    "pyrefly>=1.5.0",
+    "ruff>=0.17.6",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pyrefly]
+project-includes = ["src"]
+search-path = ["src"]
+python-version = "3.12"
+
+[tool.pyrefly.errors]
+untyped-import = false
